@@ -105,7 +105,7 @@ ReflectiveLoader:
     mov     pZwAllocateVirtualMemory, rax
     mov     pNtFlushInstructionCache, rax
     mov     pZwProtectVirtualMemory,  rax
-    xor     rcx, rcx ; disable base address as parameter. compatible with standard reflective loader.
+    xor     rcx, rcx                     ; disable base address as parameter. compatible with standard reflective loader.
     test    rcx, rcx
     jnz     .found_base
 
