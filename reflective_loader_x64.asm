@@ -143,7 +143,7 @@ ReflectiveLoader:
 
     ; =========================================================================
     ; STEP 1: walk PEB -> LDR -> InMemoryOrderModuleList
-    ;         find kernel32 and ntdll, resolve 4 function pointers by hash
+    ;         find kernel32 and ntdll, resolve 5 function pointers by hash
     ; =========================================================================
     ; x64: PEB at GS:[0x60]
     mov     rax, qword gs:[0x60]        ; rax = PEB
