@@ -168,7 +168,7 @@ ReflectiveLoader:
     mov     rdx, [rax + 0x50]          ; BaseDllName.Buffer (PWSTR)
 
     ; hash the module name (byte-by-byte over UTF-16LE, uppercase normalize)
-    xor     r12d, r12d                  ; r12d = hash accumulator
+    mov     r12d, 0                   ; r12d = hash accumulator
 .hash_modname:
     ror     r12d, 13
     movzx   ebx, byte [rdx]
@@ -717,7 +717,7 @@ ReflectiveLoader:
     ; CLOBBERS: rbx, rcx
     ; =========================================================================
 .hash_funcname:
-    xor     eax, eax
+    mov     eax, 0
 .hfn_loop:
     movzx   ebx, byte [rcx]
     test    ebx, ebx
