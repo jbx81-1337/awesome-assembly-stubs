@@ -157,7 +157,7 @@ ReflectiveLoader:
     mov     edx, [eax + 0x28]         ; BaseDllName.Buffer (PWSTR)
 
     ; hash the module name (byte-by-byte over UTF-16LE, uppercase normalize)
-    xor     edi, edi                   ; edi = hash accumulator
+    mov     edi, 0                   ; edi = hash accumulator
 .hash_modname:
     ror     edi, 13
     movzx   ebx, byte [edx]
@@ -572,14 +572,11 @@ ReflectiveLoader:
     and     eax, 0x7                   ; 3-bit index: XRW
 
     ; PIC-safe lookup of protection table
-    call    .prot_delta
-.prot_delta:
-    pop     ecx                        ; ecx = runtime address of .prot_delta
-    movzx   esi, byte [ecx + (.prot_table - .prot_delta) + eax]
+    call    .prot_table
+.got_prot_table:
+    pop     ecx                        ; ecx = runtime address of .prot_table
+    movzx   esi, byte [ecx + eax]
     jmp     .do_protect
-.prot_table:
-    ;       ---   X     R     XR    W     XW    RW    XRW
-    db      0x01, 0x10, 0x02, 0x20, 0x04, 0x40, 0x04, 0x40
 .do_protect:
     ; esi = NewProtect
 
@@ -705,3 +702,7 @@ ReflectiveLoader:
     jmp     .hfn_loop
 .hfn_done:
     ret
+.prot_table:
+    call .got_prot_table
+    ;       ---   X     R     XR    W     XW    RW    XRW
+    db      0x01, 0x10, 0x02, 0x20, 0x04, 0x40, 0x04, 0x40
