@@ -691,7 +691,7 @@ ReflectiveLoader:
     ; CLOBBERS: ebx, ecx
     ; =========================================================================
 .hash_funcname:
-    xor     eax, eax
+    mov     eax, 0
 .hfn_loop:
     movzx   ebx, byte [ecx]
     test    ebx, ebx
