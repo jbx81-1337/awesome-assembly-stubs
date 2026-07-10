@@ -572,7 +572,7 @@ ReflectiveLoader:
     and     eax, 0x7                   ; 3-bit index: XRW
 
     ; PIC-safe lookup of protection table
-    call    .prot_table
+    jmp    .prot_table
 .got_prot_table:
     pop     ecx                        ; ecx = runtime address of .prot_table
     movzx   esi, byte [ecx + eax]
